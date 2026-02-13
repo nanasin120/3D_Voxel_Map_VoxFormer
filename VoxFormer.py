@@ -1,17 +1,8 @@
-import sys
-import os
-
-# current_path = os.path.dirname(os.path.abspath(__file__))
-# lib_path = os.path.join(current_path, 'mobilestereonet')
-# sys.path.append(lib_path)
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.models import resnet50, ResNet50_Weights
+from torchvision.models import resnet18, ResNet18_Weights
 import math
-# from blocks import PositionalEncoding, MultiHead, FeedForwardNetwork
-#from mobilestereonet.models.MSNet3D import MSNet3D
 
 
 # --- Stage 1 ---
@@ -30,29 +21,29 @@ class depthNet(nn.Module):
         return depth
 
 class occupiedNet(nn.Module):
-    def __init__(self):
+    def __init__(self, channel):
         super(occupiedNet, self).__init__()
         self.layer1 = nn.Sequential( # 차원을 늘려 특징 뽑아내기 + 크기 압축
-            nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(64),
+            nn.Conv2d(in_channels=channel, out_channels=2 * channel, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(2 * channel),
             nn.ReLU()
         )
         self.layer2 = nn.Sequential( # 특징을 더 농축하기
-            nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
+            nn.Conv2d(in_channels=2 * channel, out_channels=2 * channel, kernel_size=3, padding=1),
+            nn.BatchNorm2d(2 * channel),
             nn.ReLU()
         )
         self.layer3 = nn.Sequential( # 차원을 다시 줄이기
-            nn.Conv2d(in_channels=64, out_channels=16, kernel_size=1),
+            nn.Conv2d(in_channels=2 * channel, out_channels=channel, kernel_size=1),
             nn.Sigmoid()
         )
 
     def forward(self, x):
-        # x : [B, 32, 256, 256]
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x_out = self.layer3(x)
-        return x_out
+        # x : [B, 16, 64, 64]
+        x = self.layer1(x) # x : [B, 16, 64, 64]
+        x = self.layer2(x) # x : [B, 16, 64, 64]
+        x_out = self.layer3(x) # x_out : [B, 16, 64, 64]
+        return x_out # x_out : [B, 16, 64, 64]
 
 # --- Stage 2 ---
 
@@ -160,21 +151,22 @@ class deformable_self_attention(nn.Module):
         return self.output_proj(summed_As_W_ImageF) # [B, 5000, 128]
 
 class VoxFormer(nn.Module):
-    def __init__(self, d_model = 128):
+    def __init__(self, d_model = 128, pred_num=4):
         super(VoxFormer, self).__init__()
         # --- Stage 1 ---
-        resnet = resnet50(weights=ResNet50_Weights.DEFAULT)
-        self.backbone = nn.Sequential(
+        resnet = resnet18(weights=ResNet18_Weights.DEFAULT)
+        self.backbone = nn.Sequential( # resnet18. 정보 응축
             resnet.conv1, resnet.bn1, resnet.relu, resnet.maxpool,
-            resnet.layer1, resnet.layer2, resnet.layer3 # [1024, 23, 76] 채널은 1024, 크기는 1/16
+            resnet.layer1, resnet.layer2, resnet.layer3 
+            # [256, 24, 77] 채널은 256, 크기는 1/16
         )
-        self.neck = nn.Sequential(
-            nn.Conv2d(1024, d_model, kernel_size=1),
+        self.neck = nn.Sequential( # resnet에서 나온 채널 256을 d_model로 만들어줌
+            nn.Conv2d(256, d_model, kernel_size=1),
             nn.BatchNorm2d(d_model),
             nn.ReLU()
         )
-        self.depthNet = depthNet(128, 45) # resnet이후 사용할 것
-        self.occupiedNet = occupiedNet() # 확률 복셀을 보다 더 확실하게 만들어줌
+        self.depthNet = depthNet(d_model, 45) # neck이후 사용할 것. 깊이를 뽑아낼거임
+        self.occupiedNet = occupiedNet(16) # 확률 복셀을 보다 더 확실하게 만들어줌
 
         # --- Stage 2 ---
         self.deformable_cross_attention = nn.ModuleList([
@@ -201,16 +193,17 @@ class VoxFormer(nn.Module):
         self.layer_norm_s_2 = nn.ModuleList([
             nn.LayerNorm(128) for _ in range(2)
         ])
-        self.classifier = nn.Linear(128, 20)
+        self.classifier = nn.Linear(d_model, pred_num)
         self.completion_head = nn.Sequential(
-            nn.Conv3d(in_channels=20, out_channels=40, kernel_size=3, padding=1),
-            nn.BatchNorm3d(40),
+            nn.Conv3d(in_channels=pred_num, out_channels=2*pred_num, kernel_size=3, padding=1),
+            nn.BatchNorm3d(2*pred_num),
             nn.ReLU(),
-            nn.Conv3d(in_channels=40, out_channels=40, kernel_size=3, padding=1),
-            nn.BatchNorm3d(40),
-            nn.ReLU(),
-            nn.Conv3d(in_channels=40, out_channels=20, kernel_size=3, padding=1),
+            nn.Conv3d(in_channels=2*pred_num, out_channels=pred_num, kernel_size=3, padding=1),
+            nn.BatchNorm3d(pred_num),
         )
+        self.upsample = nn.Upsample(size=(16, 64, 64), mode='trilinear', align_corners=True)
+
+        # 시간을 11초에서 4초로 일단 단축
 
         self.image_height = 370 # 원본 이미지 높이
         self.image_width = 1220 # 원본 이미지 너비
@@ -220,12 +213,13 @@ class VoxFormer(nn.Module):
         self.depth_max = 46 # 최대 깊이 + 1
         self.depth_steps = 1 # 깊이의 단계
         self.depth_bin = 45 # 깊이 차원 개수
-        self.voxel_x = 256 # 복셀 좌우
-        self.voxel_y = 32 # 복셀 앞뒤
-        self.voxel_z = 256 # 복셀 상하
-        self.voxel_size = 0.2 # 복셀 사이즈
+        self.voxel_x = 64 # 복셀 좌우
+        self.voxel_y = 16 # 복셀 앞뒤
+        self.voxel_z = 64 # 복셀 상하
+        self.voxel_size = 0.5 # 복셀 사이즈
+        self.k = 2500
 
-        self.query_embedding = nn.Embedding(5000, d_model)
+        self.query_embedding = nn.Embedding(self.k, d_model)
         self.position_encoder = nn.Linear(3, d_model)
 
         self.register_buffer('frustum', self.create_frustum())
@@ -238,25 +232,24 @@ class VoxFormer(nn.Module):
         # out of memory때문에 단안으로 진행
 
         B, N, C, H, W = image.shape
-        t0 = torch.cuda.Event(enable_timing=True) 
-        t1 = torch.cuda.Event(enable_timing=True)
+        t0 = torch.cuda.Event(enable_timing=True) # 얼마나 걸리는지 시간 체크용
+        t1 = torch.cuda.Event(enable_timing=True) # 얼마나 걸리는지 시간 체크용
         # --- Stage 1 ---
         t0.record()
-        image = image.view(B * N, C, H, W)
-        image_features = self.backbone(image) # [B * N, 1024, 24, 77]
-        image_features = self.neck(image_features) # [B * N, 128, 24, 77]
+
+        image = image.view(B * N, C, H, W) # [B * N, C, H, W] 이미지를 Conv2d에 넣기 좋게 만듬
+        image_features = self.backbone(image) # [B * N, C, H, W] -> [B * N, 256, 24, 77] 정보를 뽑아냄
+        image_features = self.neck(image_features) # [B * N, 256, 24, 77] -> [B * N, d_model, 24, 77] 차원 낮추기
         
-        depth_disparity = self.depthNet(image_features) # [B * N, 45, 24, 77]
-        _, D, H_new, W_new = depth_disparity.shape
+        depth_disparity = self.depthNet(image_features) # [B * N, d_model, 24, 77] -> [B * N, 45, 24, 77] 45개 깊이의 가능성
+        _, D, H_new, W_new = depth_disparity.shape # [D는 45, H_new, W_new는 resnet 이후의 높이와 너비]
         depth_disparity = depth_disparity.view(B, N, D, H_new, W_new) # [B, N, 45, 24, 77] 깊이, 높이, 너비 | 2.5D 표현 | 깊이 추정
 
         geometry = self.get_geometry(intrinics, rots, trans) # geometry : [B, N, 45, 24, 77, 3] | 3차원 실수 좌표값 | 역투영
+        voxelized_pseudo_point_cloud = self.voxelization(depth_disparity, geometry) # voxelized_pseudo_point_cloud : [B, 16, 64, 64] | M_in
+        M_out = self.occupiedNet(voxelized_pseudo_point_cloud) # [B, 16, 32, 32] 높이, 좌우, 앞뒤 
 
-        voxelized_pseudo_point_cloud = self.voxelization(depth_disparity, geometry) # voxelized_pseudo_point_cloud : [B, 32, 256, 256] | M_in
-
-        M_out = self.occupiedNet(voxelized_pseudo_point_cloud) # [B, 16, 128, 128] 높이, 좌우, 앞뒤 
-
-        query_proposals = self.get_query_proposal(M_out) # [B, 5000, 3] | 이 안에는 복셀중 물체가 있을 가능성이 가장 높은 복셀의 인덱스 5000개 들어있음 | Q_p
+        query_proposals = self.get_query_proposal(M_out) # [B, 2500, 3] | 이 안에는 복셀중 물체가 있을 가능성이 가장 높은 복셀의 인덱스 2500개 들어있음 | Q_p
         
         t1.record()
         torch.cuda.synchronize()
@@ -264,28 +257,28 @@ class VoxFormer(nn.Module):
         # --- Stage 2 ---  
 
         t0.record()
-        # reference_point : [B, N, 5000, 2] 복셀 3차원을 이미지 2차원 좌표로 다시 되돌림
-        # mask : [B, N, 5000] 복셀이 N개의 이미지중 어디에 있는지 True와 False로 
+        # reference_point : [B, N, 2500, 2] 복셀 3차원을 이미지 2차원 좌표로 다시 되돌림
+        # mask : [B, N, 2500] 복셀이 N개의 이미지중 어디에 있는지 True와 False로 
         reference_points, mask = self.get_reference_point(query_proposals, intrinics, rots, trans)
 
-        # [B, 5000, 128]
+        # [B, 2500, 128]
         # 위치좌표 였던 3이 128개의 위치적 의미로 변한다. 어디를 볼지이다.
         position_embedding = self.position_encoder(query_proposals.float())
         
-        # [B, 5000, 128]
-        # 5000개의 가능성이 있는 복셀안의 내용을 추적할것이다. 
+        # [B, 2500, 128]
+        # 2500개의 가능성이 있는 복셀안의 내용을 추적할것이다. 
         content_embedding = self.query_embedding.weight.unsqueeze(0).expand(B, -1, -1)
 
-        # [B, 5000, 128] 
+        # [B, 2500, 128] 
         # 위치적 의미 + 내용 = 위치를 알고 내용도 안다.
         query = content_embedding + position_embedding
-        batch_idx = torch.arange(B, device=query.device).view(B, 1).expand(B, 5000)
-        grid_size = torch.tensor([128, 16, 128], device=query_proposals.device)
+        batch_idx = torch.arange(B, device=query.device).view(B, 1).expand(B, 2500)
+        grid_size = torch.tensor([32, 16, 32], device=query_proposals.device)
         reference_points_3d = query_proposals / (grid_size - 1.0)
-        reference_points_3d = reference_points_3d * 2 - 1 # [B, 5000, 3]
-        x_idx = torch.clamp(query_proposals[..., 0].long(), 0, 128 -1) # [B, 5000] 좌우
-        y_idx = torch.clamp(query_proposals[..., 1].long(), 0, 16 -1) # [B, 5000] 상하
-        z_idx = torch.clamp(query_proposals[..., 2].long(), 0, 128 -1) # [B, 5000] 앞뒤
+        reference_points_3d = reference_points_3d * 2 - 1 # [B, 2500, 3]
+        x_idx = torch.clamp(query_proposals[..., 0].long(), 0, 32 -1) # [B, 2500] 좌우
+        y_idx = torch.clamp(query_proposals[..., 1].long(), 0, 16 -1) # [B, 2500] 상하
+        z_idx = torch.clamp(query_proposals[..., 2].long(), 0, 32 -1) # [B, 2500] 앞뒤
 
         t1.record()
         torch.cuda.synchronize()
@@ -293,31 +286,40 @@ class VoxFormer(nn.Module):
 
 
         t0.record()
+        voxel_volume = torch.zeros(B, 128, 16, 32, 32, device=query.device)
         for i in range(3):
             query = query + self.deformable_cross_attention[i](self.layer_norm_c_1[i](query), reference_points, image_features, mask)
             query = query + self.feedforwardNetwork_c[i](self.layer_norm_c_2[i](query))
 
+        t1.record()
+        torch.cuda.synchronize()
+        print(f'Until DCA : {t0.elapsed_time(t1)/1000:.4f}s')
+
+        t0.record()
         for i in range(2):
-            voxel_volume = torch.zeros(B, 128, 16, 128, 128, device=query.device)
-            voxel_volume[batch_idx, :, y_idx, x_idx, z_idx] = query # [B, 128, 16, 128, 128]
+            voxel_volume.zero_()
+            voxel_volume[batch_idx, :, y_idx, x_idx, z_idx] = query # [B, 128, 16, 32, 32]
             query = query + self.deformable_self_attention[i](self.layer_norm_s_1[i](query), reference_points_3d, voxel_volume, mask)
             query = query + self.feedforwardNetwork_s[i](self.layer_norm_s_2[i](query))
 
-        # 이제 query는 [B, 5000, 128]
+        t1.record()
+        torch.cuda.synchronize()
+        print(f'Until DSA : {t0.elapsed_time(t1)/1000:.4f}s')
 
-        logits = self.classifier(query) # [B, 5000, 20]
-        low_res_grid = torch.zeros(B, 20, 16, 128, 128, device=logits.device) # [B, 20, 16, 128, 128]
-        low_res_grid[batch_idx, :, y_idx, x_idx, z_idx] = logits
+        # 이제 query는 [B, 2500, 128]
+        t0.record()
+        logits = self.classifier(query) # [B, 2500, 20]
+        low_res_grid = torch.zeros(B, 4, 16, 32, 32, device=logits.device) # [B, 4, 16, 32, 32]
+        low_res_grid[batch_idx, :, y_idx, x_idx, z_idx] = logits # [B, 4, 16, 32, 32]
 
-        # [B, 20, 32, 256, 256]
-        dense_grid = F.interpolate(low_res_grid, size=(32, 256, 256), mode='trilinear', align_corners=True)
-        out = dense_grid + self.completion_head(dense_grid)
+        out = low_res_grid + self.completion_head(low_res_grid) # [B, 4, 16, 32, 32]
+        out = self.upsample(out) # [B, 4, 16, 32, 32]
 
         t1.record()
         torch.cuda.synchronize()
-        print(f'After transformer : {t0.elapsed_time(t1)/1000:.4f}s')
+        print(f'Until End : {t0.elapsed_time(t1)/1000:.4f}s')
 
-        return out
+        return out, M_out
 
 # --- Stage 1 ---
 
@@ -333,28 +335,28 @@ class VoxFormer(nn.Module):
     
     def get_geometry(self, intrinics, rots, trans):
         B, N = intrinics.shape[0], intrinics.shape[1]
-        frustum = self.frustum # [45, 12, 39, 3] 깊이, 높이, 너비, xyz
+        frustum = self.frustum # [45, 24, 77, 3] 깊이, 높이, 너비, xyz
 
         inv_intrincs = torch.inverse(intrinics) # [B, N, 3, 3]
 
         # inv_inrincs : [B, N, 1,  1,  1,  3, 3]
-        # frustum :     [1, 1, 45, 12, 39, 3, 1]
+        # frustum :     [1, 1, 45, 24, 77, 3, 1]
         points_c = torch.matmul(inv_intrincs.view(B, N, 1, 1, 1, 3, 3), frustum.view(1, 1, self.depth_bin, self.grid_height, self.grid_width, 3, 1))
-        # points_c : [B, N, 45, 12, 39, 3, 1]
+        # points_c : [B, N, 45, 24, 77, 3, 1]
         # print(f'points_c : {points_c.shape}')
 
         points_w = torch.matmul(rots.view(B, N, 1, 1, 1, 3, 3), points_c) + trans.view(B, N, 1, 1, 1, 3, 1)
-        # points_w : [B, N, 45, 12, 39, 3, 1]
+        # points_w : [B, N, 45, 24, 77, 3, 1]
         # print(f'points_w : {points_w.shape}')
         return points_w.squeeze(-1)
     
     def voxelization(self, depth_disparity, geometry):
-        # depth_disparity : [B, N, 45, 12, 39]
-        # geometry : [B, N, 45, 12, 39, 3] | 3차원 실수 좌표값 | 역투영
+        # depth_disparity : [B, N, 45, 24, 77]
+        # geometry : [B, N, 45, 24, 77, 3] | 3차원 실수 좌표값 | 역투영
         B, N, D, H, W, C = geometry.shape
         device = geometry.device
 
-        geom = geometry.reshape(-1, 3) # [B * N * 45 * 12 * 39, 3]
+        geom = geometry.reshape(-1, 3) # [B * N * 45 * 24 * 77, 3]
         flat_depth_disparity = depth_disparity.reshape(-1)
 
         nx = ((geom[:, 0] + self.voxel_x * self.voxel_size / 2) / self.voxel_size).long()
@@ -380,30 +382,30 @@ class VoxFormer(nn.Module):
         voxels = torch.zeros((B * self.voxel_x * self.voxel_y * self.voxel_z), device=device)
         voxels.index_add_(0, idx, flat_depth_disparity)
 
-        voxels = voxels.view(B, self.voxel_x, self.voxel_y, self.voxel_z).permute(0, 2, 1, 3) # [B, 32, 256, 256]
+        voxels = voxels.view(B, self.voxel_x, self.voxel_y, self.voxel_z).permute(0, 2, 1, 3) # [B, 16, 64, 64]
         voxels = torch.clamp(voxels, 0.0, 1.0)
 
-        return voxels
+        return voxels # [B, 16, 64, 64]
 
     def get_query_proposal(self, M_out):
-        # M_out : [B, 16, 128, 128] 높이, 좌우, 앞뒤 
-        B = M_out.shape[0]
-        M_out = M_out.view(B, -1) # [B, 16 * 128 * 128]
-        topk_value, topk_indexes = torch.topk(M_out, 5000, dim=-1)
+        # M_out : [B, 16, 32, 32] 높이, 좌우, 앞뒤 
+        B, Y, X, Z = M_out.shape
+        M_out = M_out.view(B, -1) # [B, 16 * 32 * 32]
+        topk_value, topk_indexes = torch.topk(M_out, self.k, dim=-1) # 2500개만 뽑기
 
-        y = topk_indexes // (128 * 128)
-        x = (topk_indexes // 128) % 128
-        z = topk_indexes % 128
+        y = topk_indexes // (X * Z)
+        x = (topk_indexes // X) % Z
+        z = topk_indexes % Z
 
-        query_proposals = torch.stack([y, x, z], dim=-1) # [B, 5000, 3] 높이, 좌우, 앞뒤
+        query_proposals = torch.stack([y, x, z], dim=-1) # [B, 2500, 3] 높이, 좌우, 앞뒤
 
         return query_proposals
 
 # --- Stage 2 ---  
 
     def get_reference_point(self, query_proposals, intrinics, rots, trans):
+        # query_proposal : [B, 2500, 3]
         B, N, _, _ = intrinics.shape # B, N
-        Num_Qp = query_proposals.shape[1] # 5000
 
         # 현재 query_proposals안의 값은 복셀의 인덱스임, 이걸 원래 좌표계로 돌려야함
         # 지금까지 한거 반대로 하면 됨
@@ -412,16 +414,16 @@ class VoxFormer(nn.Module):
         ny = (query_proposals[:, :, 0] + 0.5) * 2 * self.voxel_size - (self.voxel_y * self.voxel_size / 2)
         nz = (query_proposals[:, :, 2] + 0.5) * 2 * self.voxel_size - (self.voxel_z * self.voxel_size / 2)
 
-        points_world = torch.stack([nx, ny, nz], dim=-1).unsqueeze(1) # [B, 1, 5000, 3]
+        points_world = torch.stack([nx, ny, nz], dim=-1).unsqueeze(1) # [B, 1, 2500, 3]
         points_world = points_world - trans.view(B, N, 1, 3) # 원래는 [B, N, 3]
         # rots         -> [B, N, 1, 3, 3]인데 뒤의 3, 3이 바뀜
-        # points_world -> [B, 1, 5000, 3, 1]
-        # points_camera : [B, N, 5000, 3, 1(사라짐)]
+        # points_world -> [B, 1, 2500, 3, 1]
+        # points_camera : [B, N, 2500, 3, 1(사라짐)]
         points_camera = torch.matmul(rots.transpose(-1, -2).view(B, N, 1, 3, 3), points_world.unsqueeze(-1)).squeeze(-1)
 
         # intrinics -> [B, N, 1, 3, 3]
-        # points_camera -> [B, N, 5000, 3, 1]
-        # points_image : [B, N, 5000, 3, 1(사라짐)]
+        # points_camera -> [B, N, 2500, 3, 1]
+        # points_image : [B, N, 2500, 3, 1(사라짐)]
         points_image = torch.matmul(intrinics.view(B, N, 1, 3, 3), points_camera.unsqueeze(-1)).squeeze(-1)
 
         depth = points_image[..., 2] # xd, yd, d
