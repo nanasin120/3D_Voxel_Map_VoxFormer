@@ -27,10 +27,11 @@ import time
 # 배치가 2이면 0.58초
 # 배치가 1이면 0.55초
 
-B, N, c, h, w = 4, 6, 3, 370, 1220
+B, N, c, h, w = 4, 6, 3, 192, 624
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-model = VoxFormer().to(device)
+model = VoxFormer(d_model=128, pred_num=4, image_height=192, image_width=624).to(device)
+model.load_state_dict(torch.load(r'model_save\model_epoch_60.pth', weights_only=True))
 model.eval()
 
 test_image = torch.randn(B, N, c, h, w).to(device)
