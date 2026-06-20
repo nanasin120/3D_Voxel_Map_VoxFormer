@@ -58,3 +58,6 @@
 |<img width="791" height="635" alt="image" src="https://github.com/user-attachments/assets/7c692d20-d631-4cd3-8528-164542b890aa" /> |<img width="798" height="641" alt="image" src="https://github.com/user-attachments/assets/840084bc-3998-46ce-a061-f72045352e59" /> |
 
 예측데이터를 보면 뭉특한 느낌이 듭니다. Transformer 아키텍처를 사용해서 그런지 서로서로가 연결되려하는 느낌이 듭니다. LSS에 비하면 가로등 같은 얇은 장애물이 상대적으로 잘 예측되는것 같습니다. 복셀의 크기를 0.2로 낮추어보면 얇은 장애물은 더 잘 예측할 수 있을 것 같습니다.
+
+## License
+This repository is for portfolio and educational purposes only. All rights reserved by the author.
